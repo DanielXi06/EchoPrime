@@ -4,8 +4,23 @@ import argparse
 import csv
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from typing import Any
+
+
+def _set_cuda_visible_devices_from_argv() -> None:
+    for index, arg in enumerate(sys.argv):
+        if arg == "--gpu-id" and index + 1 < len(sys.argv):
+            os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[index + 1]
+            return
+        if arg.startswith("--gpu-id="):
+            os.environ["CUDA_VISIBLE_DEVICES"] = arg.split("=", 1)[1]
+            return
+
+
+_set_cuda_visible_devices_from_argv()
 
 import numpy as np
 import torch
@@ -45,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--gpu-id",
+        default=None,
+        help="Physical GPU id to expose before torch imports, e.g. --gpu-id 1.",
+    )
     return parser.parse_args()
 
 
