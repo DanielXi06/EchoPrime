@@ -25,6 +25,12 @@ _set_cuda_visible_devices_from_argv()
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - fallback for minimal environments
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 from echo_prime.video_classifier import EchoPrimeBinaryClassifier
 from echo_prime.video_data import (
     _uniform_starts,
@@ -135,11 +141,36 @@ class UnlabeledEchoPrimeVideoDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
-        frames = read_video_rgb(record.video_path)
+        try:
+            frames = read_video_rgb(record.video_path)
+        except Exception as exc:
+            return {
+                "video": None,
+                "path": str(record.video_path),
+                "error": str(exc),
+            }
         return {
             "video": self._sample_eval_clips(frames),
             "path": str(record.video_path),
+            "error": "",
         }
+
+
+def collate_predict_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    valid_items = [item for item in batch if item["video"] is not None]
+    skipped_items = [item for item in batch if item["video"] is None]
+    videos = torch.stack([item["video"] for item in valid_items], dim=0) if valid_items else None
+    return {
+        "video": videos,
+        "path": [item["path"] for item in valid_items],
+        "skipped": [
+            {
+                "video_path": item["path"],
+                "error": item["error"],
+            }
+            for item in skipped_items
+        ],
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,11 +270,18 @@ def main() -> None:
         pin_memory=True,
         drop_last=False,
         persistent_workers=args.num_workers > 0,
+        collate_fn=collate_predict_batch,
     )
 
     rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
     with torch.no_grad():
-        for batch in loader:
+        progress = tqdm(loader, total=len(loader), desc="Predicting", unit="batch")
+        for batch in progress:
+            skipped_rows.extend(batch["skipped"])
+            if batch["video"] is None:
+                continue
+
             video = batch["video"].to(device, non_blocking=True)
             logits = forward_predict_batch(model, video, aggregation, topk)
             for path, logit in zip(batch["path"], logits.detach().float().cpu().tolist()):
@@ -256,6 +294,8 @@ def main() -> None:
                         "prediction": 1 if probability >= args.threshold else 0,
                     }
                 )
+            if hasattr(progress, "set_postfix"):
+                progress.set_postfix(predicted=len(rows), skipped=len(skipped_rows))
 
     output_path = output_dir / "predictions.csv"
     with output_path.open("w", newline="", encoding="utf-8") as f:
@@ -266,8 +306,18 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
+    skipped_path = output_dir / "skipped_videos.csv"
+    with skipped_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["video_path", "error"])
+        writer.writeheader()
+        writer.writerows(skipped_rows)
+
     print(f"Saved predictions to: {output_path}")
-    print(f"num_samples={len(rows)} threshold={args.threshold} aggregation={aggregation}")
+    print(f"Saved skipped videos to: {skipped_path}")
+    print(
+        f"num_predicted={len(rows)} num_skipped={len(skipped_rows)} "
+        f"threshold={args.threshold} aggregation={aggregation}"
+    )
 
 
 if __name__ == "__main__":
