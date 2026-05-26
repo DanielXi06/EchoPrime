@@ -28,6 +28,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - fallback for minimal environments
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 from echo_prime.video_classifier import EchoPrimeBinaryClassifier
 from echo_prime.video_data import EchoPrimeVideoDataset
 
@@ -274,6 +280,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     amp: bool = False,
     scaler: torch.cuda.amp.GradScaler | None = None,
+    desc: str | None = None,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -285,7 +292,8 @@ def run_epoch(
     if scaler is None:
         scaler = torch.cuda.amp.GradScaler(enabled=False)
 
-    for batch in loader:
+    progress = tqdm(loader, total=len(loader), desc=desc, unit="batch", leave=False)
+    for batch in progress:
         video = batch["video"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True).float()
 
@@ -306,6 +314,8 @@ def run_epoch(
         total_items += batch_size
         all_labels.extend(labels.detach().cpu().tolist())
         all_logits.extend(logits.detach().float().cpu().tolist())
+        if hasattr(progress, "set_postfix"):
+            progress.set_postfix(loss=total_loss / max(1, total_items))
 
     return compute_metrics(
         labels=all_labels,
@@ -409,6 +419,7 @@ def main() -> None:
             optimizer=optimizer,
             amp=args.amp,
             scaler=scaler,
+            desc=f"Epoch {epoch:03d}/{args.epochs:03d} train",
         )
         with torch.no_grad():
             val_metrics = run_epoch(
@@ -421,6 +432,7 @@ def main() -> None:
                 topk=args.topk,
                 optimizer=None,
                 amp=args.amp,
+                desc=f"Epoch {epoch:03d}/{args.epochs:03d} val",
             )
         scheduler.step(val_metrics["loss"])
 

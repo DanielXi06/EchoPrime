@@ -114,6 +114,26 @@ def read_video_rgb(path: str | Path) -> np.ndarray:
     return np.stack(frames, axis=0)
 
 
+def get_video_frame_count(path: str | Path) -> int:
+    path = Path(path)
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {path}")
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    if frame_count <= 0:
+        raise RuntimeError(f"Could not determine frame count for video: {path}")
+    return frame_count
+
+
+def _frame_to_rgb(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim == 2:
+        frame = np.repeat(frame[..., None], 3, axis=2)
+    elif frame.shape[2] == 4:
+        frame = frame[:, :, :3]
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
 def _pad_window(window: np.ndarray, target_frames: int) -> np.ndarray:
     if len(window) >= target_frames:
         return window[:target_frames]
@@ -123,15 +143,52 @@ def _pad_window(window: np.ndarray, target_frames: int) -> np.ndarray:
     return np.concatenate([window, padding], axis=0)
 
 
-def _window_to_clip(
-    frames: np.ndarray,
+def _read_window_from_capture(
+    cap: cv2.VideoCapture,
     start: int,
     window_frames: int,
-    frame_stride: int,
 ) -> np.ndarray:
-    end = min(start + window_frames, len(frames))
-    window = _pad_window(frames[start:end], window_frames)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(start)))
+
+    frames: list[np.ndarray] = []
+    for _ in range(window_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(_frame_to_rgb(frame))
+
+    if not frames:
+        raise RuntimeError(f"No frames decoded from requested window starting at {start}")
+    return _pad_window(np.stack(frames, axis=0), window_frames)
+
+
+def read_video_windows_rgb(
+    path: str | Path,
+    starts: list[int],
+    window_frames: int,
+) -> list[np.ndarray]:
+    path = Path(path)
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {path}")
+    try:
+        return [
+            _read_window_from_capture(cap, start=max(0, int(start)), window_frames=window_frames)
+            for start in starts
+        ]
+    finally:
+        cap.release()
+
+
+def window_to_clip(window: np.ndarray, frame_stride: int) -> np.ndarray:
     return window[::frame_stride]
+
+
+def sample_train_start(num_frames: int, window_frames: int) -> int:
+    max_start = max(0, int(num_frames) - int(window_frames))
+    if max_start == 0:
+        return 0
+    return random.randint(0, max_start)
 
 
 def _uniform_starts(num_frames: int, window_frames: int, num_clips: int) -> list[int]:
@@ -228,33 +285,32 @@ class EchoPrimeVideoDataset(Dataset):
     def clip_frames(self) -> int:
         return self.window_frames // self.frame_stride
 
-    def _sample_train_clip(self, frames: np.ndarray) -> torch.Tensor:
-        if len(frames) > self.window_frames:
-            start = random.randint(0, len(frames) - self.window_frames)
-        else:
-            start = 0
-        clip = _window_to_clip(frames, start, self.window_frames, self.frame_stride)
+    def _sample_train_clip(self, path: Path, num_frames: int) -> torch.Tensor:
+        start = sample_train_start(num_frames, self.window_frames)
+        window = read_video_windows_rgb(path, [start], self.window_frames)[0]
+        clip = window_to_clip(window, self.frame_stride)
         return preprocess_clip(clip, self.video_size, self.zoom)
 
-    def _sample_eval_clips(self, frames: np.ndarray) -> torch.Tensor:
-        starts = _uniform_starts(len(frames), self.window_frames, self.eval_clips)
+    def _sample_eval_clips(self, path: Path, num_frames: int) -> torch.Tensor:
+        starts = _uniform_starts(num_frames, self.window_frames, self.eval_clips)
+        windows = read_video_windows_rgb(path, starts, self.window_frames)
         clips = [
             preprocess_clip(
-                _window_to_clip(frames, start, self.window_frames, self.frame_stride),
+                window_to_clip(window, self.frame_stride),
                 self.video_size,
                 self.zoom,
             )
-            for start in starts
+            for window in windows
         ]
         return torch.stack(clips, dim=0)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
-        frames = read_video_rgb(record.video_path)
+        num_frames = get_video_frame_count(record.video_path)
         video = (
-            self._sample_train_clip(frames)
+            self._sample_train_clip(record.video_path, num_frames)
             if self.mode == "train"
-            else self._sample_eval_clips(frames)
+            else self._sample_eval_clips(record.video_path, num_frames)
         )
         return {
             "video": video,

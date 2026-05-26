@@ -34,9 +34,10 @@ except ImportError:  # pragma: no cover - fallback for minimal environments
 from echo_prime.video_classifier import EchoPrimeBinaryClassifier
 from echo_prime.video_data import (
     _uniform_starts,
-    _window_to_clip,
+    get_video_frame_count,
     preprocess_clip,
-    read_video_rgb,
+    read_video_windows_rgb,
+    window_to_clip,
 )
 from train_video_classifier import aggregate_clip_logits
 
@@ -127,22 +128,24 @@ class UnlabeledEchoPrimeVideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def _sample_eval_clips(self, frames):
-        starts = _uniform_starts(len(frames), self.window_frames, self.eval_clips)
+    def _sample_eval_clips(self, path: Path, num_frames: int):
+        starts = _uniform_starts(num_frames, self.window_frames, self.eval_clips)
+        windows = read_video_windows_rgb(path, starts, self.window_frames)
         clips = [
             preprocess_clip(
-                _window_to_clip(frames, start, self.window_frames, self.frame_stride),
+                window_to_clip(window, self.frame_stride),
                 self.video_size,
                 self.zoom,
             )
-            for start in starts
+            for window in windows
         ]
         return torch.stack(clips, dim=0)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         try:
-            frames = read_video_rgb(record.video_path)
+            num_frames = get_video_frame_count(record.video_path)
+            video = self._sample_eval_clips(record.video_path, num_frames)
         except Exception as exc:
             return {
                 "video": None,
@@ -150,7 +153,7 @@ class UnlabeledEchoPrimeVideoDataset(Dataset):
                 "error": str(exc),
             }
         return {
-            "video": self._sample_eval_clips(frames),
+            "video": video,
             "path": str(record.video_path),
             "error": "",
         }
