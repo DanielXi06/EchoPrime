@@ -27,6 +27,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - fallback for minimal environments
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 from echo_prime.video_classifier import EchoPrimeBinaryClassifier
 from echo_prime.video_data import EchoPrimeVideoDataset
 from train_video_classifier import aggregate_clip_logits, binary_auc, compute_metrics
@@ -102,6 +108,100 @@ def forward_eval_batch(
     return aggregate_clip_logits(clip_logits, aggregation, topk)
 
 
+def build_confusion_matrix(
+    labels: list[float],
+    logits: list[float],
+    threshold: float,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    label_order = ["Healthy", "Disease"]
+    matrix = np.zeros((2, 2), dtype=int)
+    for label, logit in zip(labels, logits):
+        actual = int(float(label))
+        probability = sigmoid(float(logit))
+        predicted = 1 if probability >= threshold else 0
+        matrix[actual, predicted] += 1
+
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    percent = np.divide(
+        matrix,
+        row_sums,
+        out=np.zeros_like(matrix, dtype=float),
+        where=row_sums != 0,
+    ) * 100.0
+    return label_order, matrix, percent
+
+
+def save_confusion_outputs(
+    labels: list[float],
+    logits: list[float],
+    threshold: float,
+    output_dir: Path,
+) -> None:
+    label_order, matrix, percent = build_confusion_matrix(labels, logits, threshold)
+    tag = f"threshold_{threshold:.3f}".replace(".", "p")
+
+    with (output_dir / f"confusion_matrix_counts_{tag}.csv").open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.writer(f)
+        writer.writerow(["actual\\predicted", *label_order])
+        for label_name, row in zip(label_order, matrix):
+            writer.writerow([label_name, *[int(value) for value in row]])
+
+    with (output_dir / f"confusion_matrix_percent_{tag}.csv").open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.writer(f)
+        writer.writerow(["actual\\predicted", *label_order])
+        for label_name, row in zip(label_order, percent):
+            writer.writerow([label_name, *[f"{value:.4f}" for value in row]])
+
+    payload = {
+        "label_order": label_order,
+        "counts": matrix.tolist(),
+        "row_percent": percent.tolist(),
+        "threshold": threshold,
+    }
+    (output_dir / f"confusion_matrix_{tag}.json").write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 6), dpi=300)
+    image = ax.imshow(percent, cmap="YlGnBu", vmin=0, vmax=100)
+    ax.set_xticks(range(len(label_order)), labels=label_order)
+    ax.set_yticks(range(len(label_order)), labels=label_order)
+    ax.set_xlabel("Predicted Label")
+    ax.set_ylabel("True Label")
+    ax.set_title("Binary Video-Level Confusion Matrix")
+
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            ax.text(
+                j,
+                i,
+                f"{matrix[i, j]}\n{percent[i, j]:.1f}%",
+                ha="center",
+                va="center",
+                color="black",
+            )
+
+    colorbar = fig.colorbar(image, ax=ax)
+    colorbar.set_label("Percentage within true class (%)")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"confusion_matrix_{tag}.png")
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
@@ -145,7 +245,8 @@ def main() -> None:
     total_items = 0
 
     with torch.no_grad():
-        for batch in loader:
+        progress = tqdm(loader, total=len(loader), desc="Testing", unit="batch")
+        for batch in progress:
             video = batch["video"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True).float()
             logits = forward_eval_batch(model, video, aggregation, topk)
@@ -157,6 +258,8 @@ def main() -> None:
             batch_labels = labels.detach().cpu().tolist()
             all_logits.extend(batch_logits)
             all_labels.extend(batch_labels)
+            if hasattr(progress, "set_postfix"):
+                progress.set_postfix(loss=total_loss / max(1, total_items))
             for path, label, logit in zip(batch["path"], batch_labels, batch_logits):
                 prob = sigmoid(float(logit))
                 rows.append(
@@ -181,6 +284,7 @@ def main() -> None:
     metrics["eval_aggregation"] = aggregation
     metrics["topk"] = topk
     metrics["auc"] = binary_auc(all_labels, [sigmoid(v) for v in all_logits])
+    save_confusion_outputs(all_labels, all_logits, args.threshold, output_dir)
 
     with (output_dir / "test_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
@@ -193,6 +297,8 @@ def main() -> None:
         writer.writerows(rows)
 
     print(json.dumps(metrics, indent=2))
+    print(f"Accuracy: {metrics['acc']:.4f}")
+    print(f"Confusion matrix outputs saved to: {output_dir}")
 
 
 if __name__ == "__main__":
