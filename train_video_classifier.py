@@ -35,12 +35,12 @@ except ImportError:  # pragma: no cover - fallback for minimal environments
         return iterable
 
 from echo_prime.video_classifier import EchoPrimeBinaryClassifier
-from echo_prime.video_data import EchoPrimeVideoDataset
+from echo_prime.video_data import EchoPrimeVideoDataset, parse_class_names
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a video-level binary classifier from EchoPrime encoder weights."
+        description="Train a video-level classifier from EchoPrime encoder weights."
     )
     parser.add_argument("--train-csv", required=True, help="CSV containing training videos.")
     parser.add_argument("--val-csv", default=None, help="CSV containing validation videos.")
@@ -50,6 +50,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-column", default=None)
     parser.add_argument("--train-split", default=None)
     parser.add_argument("--val-split", default=None)
+    parser.add_argument(
+        "--task",
+        choices=["binary", "multiclass"],
+        default="binary",
+        help="Keep the original BCE binary flow, or train a CE multiclass head.",
+    )
+    parser.add_argument(
+        "--num-classes",
+        type=int,
+        default=1,
+        help="Use 1 for the original binary head; use 4 for healthy/ASD/VSD/PDA.",
+    )
+    parser.add_argument(
+        "--class-names",
+        default="healthy,ASD,VSD,PDA",
+        help="Comma-separated class names used to map string labels and name reports.",
+    )
     parser.add_argument(
         "--weights-path",
         default="model_data/weights/echo_prime_encoder.pt",
@@ -91,13 +108,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-factor", type=float, default=0.1)
     parser.add_argument(
         "--best-metric",
-        choices=["val_loss", "val_acc", "val_auc"],
+        choices=["val_loss", "val_acc", "val_auc", "val_macro_f1"],
         default="val_auc",
     )
     parser.add_argument(
         "--pos-weight",
         default="auto",
         help="'auto', 'none', or a float passed to BCEWithLogitsLoss.",
+    )
+    parser.add_argument(
+        "--class-weights",
+        default="none",
+        help="'none', 'auto', or comma-separated weights passed to CrossEntropyLoss.",
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
@@ -109,7 +131,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-plot-curves", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.task == "binary":
+        args.num_classes = 1
+    elif args.num_classes <= 1:
+        parser.error("--task multiclass requires --num-classes greater than 1.")
+
+    class_names = parse_class_names(args.class_names)
+    if args.task == "multiclass" and class_names and len(class_names) != args.num_classes:
+        parser.error(
+            "--class-names length must match --num-classes for multiclass training."
+        )
+    if args.task == "multiclass" and args.best_metric == "val_auc":
+        args.best_metric = "val_macro_f1"
+    return args
 
 
 def set_seed(seed: int) -> None:
@@ -121,6 +156,7 @@ def set_seed(seed: int) -> None:
 
 def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     val_csv = args.val_csv or args.train_csv
+    class_names = parse_class_names(args.class_names) if args.task == "multiclass" else None
     train_dataset = EchoPrimeVideoDataset(
         csv_path=args.train_csv,
         data_root=args.data_root,
@@ -130,6 +166,8 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         split_value=args.train_split,
         mode="train",
         eval_clips=args.eval_clips,
+        num_classes=args.num_classes,
+        class_names=class_names,
     )
     val_dataset = EchoPrimeVideoDataset(
         csv_path=val_csv,
@@ -140,6 +178,8 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         split_value=args.val_split,
         mode="eval",
         eval_clips=args.eval_clips,
+        num_classes=args.num_classes,
+        class_names=class_names,
     )
 
     train_loader = DataLoader(
@@ -176,6 +216,30 @@ def positive_weight(labels: list[float], arg_value: str, device: torch.device) -
     return torch.tensor([float(value)], dtype=torch.float32, device=device)
 
 
+def class_weights(
+    labels: list[float | int],
+    arg_value: str,
+    num_classes: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    value = str(arg_value).strip().lower()
+    if value in {"none", "false", "0", ""}:
+        return None
+    if value == "auto":
+        counts = np.bincount(np.asarray(labels, dtype=np.int64), minlength=num_classes)
+        if np.any(counts == 0):
+            return None
+        weights = counts.sum() / (num_classes * counts.astype(np.float64))
+        return torch.as_tensor(weights, dtype=torch.float32, device=device)
+
+    weights = [float(item.strip()) for item in str(arg_value).split(",") if item.strip()]
+    if len(weights) != num_classes:
+        raise ValueError(
+            f"--class-weights must provide {num_classes} values, got {len(weights)}"
+        )
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
 def build_optimizer(
     model: EchoPrimeBinaryClassifier,
     args: argparse.Namespace,
@@ -195,15 +259,22 @@ def aggregate_clip_logits(
     method: str,
     topk: int,
 ) -> torch.Tensor:
-    if logits.ndim != 2:
-        raise ValueError(f"Expected logits of shape B x K, got {tuple(logits.shape)}")
+    if logits.ndim not in {2, 3}:
+        raise ValueError(
+            f"Expected logits of shape B x K or B x K x C, got {tuple(logits.shape)}"
+        )
     if method == "mean":
         return logits.mean(dim=1)
     if method == "max":
         return logits.max(dim=1).values
     if method == "topk_mean":
         k = min(max(1, topk), logits.shape[1])
-        return torch.topk(logits, k=k, dim=1).values.mean(dim=1)
+        if logits.ndim == 2:
+            return torch.topk(logits, k=k, dim=1).values.mean(dim=1)
+        clip_scores = logits.max(dim=2).values
+        indices = torch.topk(clip_scores, k=k, dim=1).indices
+        gather_index = indices.unsqueeze(-1).expand(-1, -1, logits.shape[-1])
+        return torch.gather(logits, dim=1, index=gather_index).mean(dim=1)
     raise ValueError(f"Unsupported aggregation method: {method}")
 
 
@@ -219,7 +290,10 @@ def forward_batch(
         batch_size, num_clips, channels, frames, height, width = video.shape
         flat_video = video.reshape(batch_size * num_clips, channels, frames, height, width)
         flat_logits = model(flat_video)
-        clip_logits = flat_logits.reshape(batch_size, num_clips)
+        if flat_logits.ndim == 1:
+            clip_logits = flat_logits.reshape(batch_size, num_clips)
+        else:
+            clip_logits = flat_logits.reshape(batch_size, num_clips, -1)
         return aggregate_clip_logits(clip_logits, aggregation, topk)
     raise ValueError(f"Unsupported video tensor shape: {tuple(video.shape)}")
 
@@ -269,11 +343,64 @@ def compute_metrics(
     }
 
 
+def compute_multiclass_metrics(
+    labels: list[int],
+    logits: list[list[float]],
+    loss: float,
+    num_classes: int,
+) -> dict[str, float]:
+    if not labels:
+        return {
+            "loss": loss,
+            "acc": float("nan"),
+            "macro_precision": float("nan"),
+            "macro_recall": float("nan"),
+            "macro_f1": float("nan"),
+        }
+
+    y_true = np.asarray(labels, dtype=np.int64)
+    y_score = np.asarray(logits, dtype=np.float64)
+    y_pred = np.argmax(y_score, axis=1)
+
+    matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for actual, predicted in zip(y_true, y_pred):
+        if 0 <= actual < num_classes and 0 <= predicted < num_classes:
+            matrix[actual, predicted] += 1
+
+    precision_values: list[float] = []
+    recall_values: list[float] = []
+    f1_values: list[float] = []
+    for class_index in range(num_classes):
+        tp = float(matrix[class_index, class_index])
+        fp = float(matrix[:, class_index].sum() - matrix[class_index, class_index])
+        fn = float(matrix[class_index, :].sum() - matrix[class_index, class_index])
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision + recall > 0
+            else 0.0
+        )
+        precision_values.append(precision)
+        recall_values.append(recall)
+        f1_values.append(f1)
+
+    return {
+        "loss": loss,
+        "acc": float((y_true == y_pred).mean()),
+        "macro_precision": float(np.mean(precision_values)),
+        "macro_recall": float(np.mean(recall_values)),
+        "macro_f1": float(np.mean(f1_values)),
+    }
+
+
 def run_epoch(
     model: EchoPrimeBinaryClassifier,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    task: str,
+    num_classes: int,
     threshold: float,
     aggregation: str,
     topk: int,
@@ -286,8 +413,8 @@ def run_epoch(
     model.train(is_train)
     total_loss = 0.0
     total_items = 0
-    all_labels: list[float] = []
-    all_logits: list[float] = []
+    all_labels: list[Any] = []
+    all_logits: list[Any] = []
     scaler_enabled = amp and device.type == "cuda"
     if scaler is None:
         scaler = torch.cuda.amp.GradScaler(enabled=False)
@@ -295,7 +422,8 @@ def run_epoch(
     progress = tqdm(loader, total=len(loader), desc=desc, unit="batch", leave=False)
     for batch in progress:
         video = batch["video"].to(device, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True).float()
+        labels = batch["label"].to(device, non_blocking=True)
+        labels = labels.float() if task == "binary" else labels.long()
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -317,11 +445,18 @@ def run_epoch(
         if hasattr(progress, "set_postfix"):
             progress.set_postfix(loss=total_loss / max(1, total_items))
 
-    return compute_metrics(
+    if task == "binary":
+        return compute_metrics(
+            labels=all_labels,
+            logits=all_logits,
+            loss=total_loss / max(1, total_items),
+            threshold=threshold,
+        )
+    return compute_multiclass_metrics(
         labels=all_labels,
         logits=all_logits,
         loss=total_loss / max(1, total_items),
-        threshold=threshold,
+        num_classes=num_classes,
     )
 
 
@@ -392,6 +527,7 @@ def main() -> None:
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
         freeze_encoder=args.freeze_encoder,
+        num_classes=args.num_classes,
     ).to(device)
     optimizer = build_optimizer(model, args)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -400,8 +536,17 @@ def main() -> None:
         factor=args.scheduler_factor,
         patience=args.scheduler_patience,
     )
-    pos_weight = positive_weight(train_loader.dataset.labels(), args.pos_weight, device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if args.task == "binary":
+        pos_weight = positive_weight(train_loader.dataset.labels(), args.pos_weight, device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        weights = class_weights(
+            train_loader.dataset.labels(),
+            args.class_weights,
+            args.num_classes,
+            device,
+        )
+        criterion = nn.CrossEntropyLoss(weight=weights)
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
     metric_rows: list[dict[str, Any]] = []
@@ -413,6 +558,8 @@ def main() -> None:
             loader=train_loader,
             criterion=criterion,
             device=device,
+            task=args.task,
+            num_classes=args.num_classes,
             threshold=args.threshold,
             aggregation=args.eval_aggregation,
             topk=args.topk,
@@ -427,6 +574,8 @@ def main() -> None:
                 loader=val_loader,
                 criterion=criterion,
                 device=device,
+                task=args.task,
+                num_classes=args.num_classes,
                 threshold=args.threshold,
                 aggregation=args.eval_aggregation,
                 topk=args.topk,
@@ -469,14 +618,24 @@ def main() -> None:
         if is_best:
             torch.save(payload, output_dir / "best.pt")
 
-        print(
-            f"Epoch {epoch:03d}/{args.epochs:03d} "
-            f"train_loss={train_metrics['loss']:.4f} "
-            f"train_acc={train_metrics['acc']:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} "
-            f"val_acc={val_metrics['acc']:.4f} "
-            f"val_auc={val_metrics['auc']:.4f}"
-        )
+        if args.task == "binary":
+            print(
+                f"Epoch {epoch:03d}/{args.epochs:03d} "
+                f"train_loss={train_metrics['loss']:.4f} "
+                f"train_acc={train_metrics['acc']:.4f} "
+                f"val_loss={val_metrics['loss']:.4f} "
+                f"val_acc={val_metrics['acc']:.4f} "
+                f"val_auc={val_metrics['auc']:.4f}"
+            )
+        else:
+            print(
+                f"Epoch {epoch:03d}/{args.epochs:03d} "
+                f"train_loss={train_metrics['loss']:.4f} "
+                f"train_acc={train_metrics['acc']:.4f} "
+                f"val_loss={val_metrics['loss']:.4f} "
+                f"val_acc={val_metrics['acc']:.4f} "
+                f"val_macro_f1={val_metrics['macro_f1']:.4f}"
+            )
 
     if not args.no_plot_curves:
         maybe_plot(output_dir / "metrics.csv", output_dir)

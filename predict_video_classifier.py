@@ -35,6 +35,7 @@ from echo_prime.video_classifier import EchoPrimeBinaryClassifier
 from echo_prime.video_data import (
     _uniform_starts,
     get_video_frame_count,
+    parse_class_names,
     preprocess_clip,
     read_video_windows_rgb,
     window_to_clip,
@@ -186,6 +187,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path-column", default="video_path")
     parser.add_argument("--split-column", default=None)
     parser.add_argument("--split-value", default=None)
+    parser.add_argument("--task", choices=["binary", "multiclass"], default=None)
+    parser.add_argument("--num-classes", type=int, default=None)
+    parser.add_argument(
+        "--class-names",
+        default=None,
+        help="Comma-separated class names. Defaults to names stored in checkpoint.",
+    )
     parser.add_argument(
         "--weights-path",
         default=None,
@@ -211,7 +219,41 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(args: argparse.Namespace, device: torch.device) -> EchoPrimeBinaryClassifier:
+def resolve_task_config(
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any],
+) -> tuple[str, int, list[str]]:
+    train_args = checkpoint.get("args", {})
+    model_config = checkpoint.get("model_config", {})
+    inferred_num_classes = int(
+        model_config.get("num_classes", train_args.get("num_classes", 1))
+    )
+    inferred_task = train_args.get(
+        "task",
+        "multiclass" if inferred_num_classes > 1 else "binary",
+    )
+
+    task = args.task or inferred_task
+    if task == "binary":
+        num_classes = 1
+    else:
+        num_classes = int(args.num_classes or inferred_num_classes)
+        if num_classes <= 1:
+            raise ValueError("--task multiclass requires --num-classes greater than 1.")
+
+    class_names = parse_class_names(args.class_names or train_args.get("class_names"))
+    if task == "multiclass" and not class_names:
+        class_names = [f"Class_{index}" for index in range(num_classes)]
+    if task == "multiclass" and len(class_names) != num_classes:
+        raise ValueError("--class-names length must match --num-classes.")
+    return task, num_classes, class_names
+
+
+def load_model(
+    args: argparse.Namespace,
+    device: torch.device,
+    num_classes: int,
+) -> EchoPrimeBinaryClassifier:
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     config = dict(checkpoint.get("model_config", {}))
     if args.weights_path:
@@ -219,6 +261,7 @@ def load_model(args: argparse.Namespace, device: torch.device) -> EchoPrimeBinar
     if "weights_path" not in config:
         raise ValueError("Checkpoint has no model_config.weights_path; pass --weights-path.")
     config["freeze_encoder"] = True
+    config["num_classes"] = num_classes
     model = EchoPrimeBinaryClassifier(**config)
     model.load_state_dict(checkpoint["model_state"])
     model.to(device)
@@ -237,7 +280,10 @@ def forward_predict_batch(
     batch_size, num_clips, channels, frames, height, width = video.shape
     flat_video = video.reshape(batch_size * num_clips, channels, frames, height, width)
     flat_logits = model(flat_video)
-    clip_logits = flat_logits.reshape(batch_size, num_clips)
+    if flat_logits.ndim == 1:
+        clip_logits = flat_logits.reshape(batch_size, num_clips)
+    else:
+        clip_logits = flat_logits.reshape(batch_size, num_clips, -1)
     return aggregate_clip_logits(clip_logits, aggregation, topk)
 
 
@@ -245,6 +291,7 @@ def main() -> None:
     args = parse_args()
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     train_args = checkpoint.get("args", {})
+    task, num_classes, class_names = resolve_task_config(args, checkpoint)
     aggregation = args.eval_aggregation or train_args.get("eval_aggregation", "mean")
     topk = args.topk or int(train_args.get("topk", 3))
 
@@ -256,7 +303,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model = load_model(args, device)
+    model = load_model(args, device, num_classes)
     dataset = UnlabeledEchoPrimeVideoDataset(
         csv_path=args.predict_csv,
         data_root=args.data_root,
@@ -287,25 +334,47 @@ def main() -> None:
 
             video = batch["video"].to(device, non_blocking=True)
             logits = forward_predict_batch(model, video, aggregation, topk)
-            for path, logit in zip(batch["path"], logits.detach().float().cpu().tolist()):
-                probability = sigmoid(float(logit))
-                rows.append(
-                    {
+            if task == "binary":
+                for path, logit in zip(batch["path"], logits.detach().float().cpu().tolist()):
+                    probability = sigmoid(float(logit))
+                    rows.append(
+                        {
+                            "video_path": path,
+                            "logit": logit,
+                            "probability": probability,
+                            "prediction": 1 if probability >= args.threshold else 0,
+                        }
+                    )
+            else:
+                logits_cpu = logits.detach().float().cpu()
+                probs = torch.softmax(logits_cpu, dim=1)
+                for path, logit_values, prob_values in zip(
+                    batch["path"],
+                    logits_cpu.tolist(),
+                    probs.tolist(),
+                ):
+                    prediction = int(torch.as_tensor(logit_values).argmax().item())
+                    row: dict[str, Any] = {
                         "video_path": path,
-                        "logit": logit,
-                        "probability": probability,
-                        "prediction": 1 if probability >= args.threshold else 0,
+                        "prediction": prediction,
+                        "prediction_name": class_names[prediction],
                     }
-                )
+                    for index, name in enumerate(class_names):
+                        row[f"logit_{name}"] = logit_values[index]
+                        row[f"prob_{name}"] = prob_values[index]
+                    rows.append(row)
             if hasattr(progress, "set_postfix"):
                 progress.set_postfix(predicted=len(rows), skipped=len(skipped_rows))
 
     output_path = output_dir / "predictions.csv"
     with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["video_path", "logit", "probability", "prediction"],
-        )
+        if task == "binary":
+            fieldnames = ["video_path", "logit", "probability", "prediction"]
+        else:
+            fieldnames = ["video_path", "prediction", "prediction_name"]
+            for name in class_names:
+                fieldnames.extend([f"logit_{name}", f"prob_{name}"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -319,7 +388,7 @@ def main() -> None:
     print(f"Saved skipped videos to: {skipped_path}")
     print(
         f"num_predicted={len(rows)} num_skipped={len(skipped_rows)} "
-        f"threshold={args.threshold} aggregation={aggregation}"
+        f"task={task} threshold={args.threshold} aggregation={aggregation}"
     )
 
 

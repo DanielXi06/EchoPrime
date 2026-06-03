@@ -23,7 +23,7 @@ ECHO_PRIME_STD = torch.tensor([47.989223, 46.456997, 47.20083]).reshape(
 @dataclass(frozen=True)
 class VideoRecord:
     video_path: Path
-    label: float
+    label: float | int
     raw: dict[str, Any]
 
 
@@ -38,6 +38,50 @@ def parse_binary_label(value: str) -> float:
     label = float(normalized)
     if label not in (0.0, 1.0):
         raise ValueError(f"Binary label must be 0 or 1, got {value!r}")
+    return label
+
+
+def parse_class_names(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def parse_label(
+    value: str,
+    num_classes: int = 1,
+    class_names: str | list[str] | tuple[str, ...] | None = None,
+) -> float | int:
+    if int(num_classes) == 1:
+        return parse_binary_label(value)
+
+    normalized = str(value).strip()
+    names = parse_class_names(class_names)
+    if names:
+        lookup = {name.lower(): index for index, name in enumerate(names)}
+        matched = lookup.get(normalized.lower())
+        if matched is not None:
+            return matched
+
+    try:
+        numeric = float(normalized)
+    except ValueError as exc:
+        if names:
+            raise ValueError(
+                f"Unknown class label {value!r}; expected one of {names} "
+                "or an integer class id."
+            ) from exc
+        raise ValueError(f"Class label must be an integer id, got {value!r}") from exc
+
+    if not numeric.is_integer():
+        raise ValueError(f"Class label must be an integer id, got {value!r}")
+    label = int(numeric)
+    if label < 0 or label >= int(num_classes):
+        raise ValueError(
+            f"Class label must be in [0, {int(num_classes) - 1}], got {value!r}"
+        )
     return label
 
 
@@ -61,6 +105,8 @@ def load_video_records(
     label_column: str = "label",
     split_column: str | None = None,
     split_value: str | None = None,
+    num_classes: int = 1,
+    class_names: str | list[str] | tuple[str, ...] | None = None,
 ) -> list[VideoRecord]:
     csv_path = Path(csv_path)
     records: list[VideoRecord] = []
@@ -81,7 +127,11 @@ def load_video_records(
             records.append(
                 VideoRecord(
                     video_path=_resolve_video_path(row[path_column], csv_path, data_root),
-                    label=parse_binary_label(row[label_column]),
+                    label=parse_label(
+                        row[label_column],
+                        num_classes=num_classes,
+                        class_names=class_names,
+                    ),
                     raw=dict(row),
                 )
             )
@@ -257,6 +307,8 @@ class EchoPrimeVideoDataset(Dataset):
         frame_stride: int = 2,
         video_size: int = 224,
         zoom: float = 0.1,
+        num_classes: int = 1,
+        class_names: str | list[str] | tuple[str, ...] | None = None,
     ) -> None:
         if mode not in {"train", "eval"}:
             raise ValueError(f"mode must be 'train' or 'eval', got {mode!r}")
@@ -267,6 +319,8 @@ class EchoPrimeVideoDataset(Dataset):
             label_column=label_column,
             split_column=split_column,
             split_value=split_value,
+            num_classes=num_classes,
+            class_names=class_names,
         )
         self.mode = mode
         self.eval_clips = int(eval_clips)
@@ -274,11 +328,13 @@ class EchoPrimeVideoDataset(Dataset):
         self.frame_stride = int(frame_stride)
         self.video_size = int(video_size)
         self.zoom = float(zoom)
+        self.num_classes = int(num_classes)
+        self.class_names = parse_class_names(class_names)
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def labels(self) -> list[float]:
+    def labels(self) -> list[float | int]:
         return [record.label for record in self.records]
 
     @property
@@ -314,6 +370,9 @@ class EchoPrimeVideoDataset(Dataset):
         )
         return {
             "video": video,
-            "label": torch.tensor(record.label, dtype=torch.float32),
+            "label": torch.tensor(
+                record.label,
+                dtype=torch.float32 if self.num_classes == 1 else torch.long,
+            ),
             "path": str(record.video_path),
         }

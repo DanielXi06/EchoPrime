@@ -55,6 +55,7 @@ def plot_metrics(metrics_csv: str | Path, output_dir: str | Path) -> None:
         "accuracy.png": ["train_acc", "val_acc"],
         "auc.png": ["train_auc", "val_auc"],
         "f1.png": ["train_f1", "val_f1"],
+        "macro_f1.png": ["train_macro_f1", "val_macro_f1"],
         "sensitivity.png": ["train_sensitivity", "val_sensitivity"],
         "specificity.png": ["train_specificity", "val_specificity"],
         "learning_rate.png": ["lr_encoder", "lr_head"],
