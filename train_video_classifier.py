@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated class names used to map string labels and name reports.",
     )
     parser.add_argument(
+        "--include-classes",
+        default=None,
+        help="Optional comma-separated labels to keep before parsing, e.g. ASD,VSD,PDA.",
+    )
+    parser.add_argument(
         "--weights-path",
         default="model_data/weights/echo_prime_encoder.pt",
         help="Path to echo_prime_encoder.pt.",
@@ -131,6 +136,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-plot-curves", action="store_true")
+    parser.add_argument(
+        "--early-stopping",
+        action="store_true",
+        help="Stop training when the selected --best-metric stops improving.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=10,
+        help="Number of non-improving epochs allowed when --early-stopping is set.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum improvement required to reset early-stopping patience.",
+    )
     args = parser.parse_args()
     if args.task == "binary":
         args.num_classes = 1
@@ -144,6 +166,10 @@ def parse_args() -> argparse.Namespace:
         )
     if args.task == "multiclass" and args.best_metric == "val_auc":
         args.best_metric = "val_macro_f1"
+    if args.early_stopping_patience < 1:
+        parser.error("--early-stopping-patience must be >= 1.")
+    if args.early_stopping_min_delta < 0:
+        parser.error("--early-stopping-min-delta must be >= 0.")
     return args
 
 
@@ -168,6 +194,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         eval_clips=args.eval_clips,
         num_classes=args.num_classes,
         class_names=class_names,
+        include_classes=args.include_classes,
     )
     val_dataset = EchoPrimeVideoDataset(
         csv_path=val_csv,
@@ -180,6 +207,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
         eval_clips=args.eval_clips,
         num_classes=args.num_classes,
         class_names=class_names,
+        include_classes=args.include_classes,
     )
 
     train_loader = DataLoader(
@@ -481,12 +509,17 @@ def checkpoint_payload(
     }
 
 
-def metric_improved(name: str, value: float, best: float) -> bool:
+def metric_improved(
+    name: str,
+    value: float,
+    best: float,
+    min_delta: float = 0.0,
+) -> bool:
     if math.isnan(value):
         return False
     if name == "val_loss":
-        return value < best
-    return value > best
+        return value < best - min_delta
+    return value > best + min_delta
 
 
 def write_metrics(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -551,6 +584,7 @@ def main() -> None:
 
     metric_rows: list[dict[str, Any]] = []
     best_value = float("inf") if args.best_metric == "val_loss" else -float("inf")
+    epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
@@ -601,9 +635,17 @@ def main() -> None:
         if args.best_metric == "val_auc" and math.isnan(float(selected_value)):
             selected_value = -val_metrics["loss"]
 
-        is_best = metric_improved(args.best_metric, float(selected_value), best_value)
+        is_best = metric_improved(
+            args.best_metric,
+            float(selected_value),
+            best_value,
+            min_delta=args.early_stopping_min_delta,
+        )
         if is_best:
             best_value = float(selected_value)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         payload = checkpoint_payload(
             model=model,
@@ -636,6 +678,14 @@ def main() -> None:
                 f"val_acc={val_metrics['acc']:.4f} "
                 f"val_macro_f1={val_metrics['macro_f1']:.4f}"
             )
+
+        if args.early_stopping and epochs_without_improvement >= args.early_stopping_patience:
+            print(
+                f"Early stopping at epoch {epoch:03d}: "
+                f"{args.best_metric} did not improve for "
+                f"{epochs_without_improvement} epoch(s)."
+            )
+            break
 
     if not args.no_plot_curves:
         maybe_plot(output_dir / "metrics.csv", output_dir)

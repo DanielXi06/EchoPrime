@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated class names. Defaults to names stored in checkpoint.",
     )
     parser.add_argument(
+        "--include-classes",
+        default=None,
+        help="Optional comma-separated labels to keep before parsing, e.g. ASD,VSD,PDA.",
+    )
+    parser.add_argument(
         "--weights-path",
         default=None,
         help="Override encoder weights path used only to initialize the model skeleton.",
@@ -264,6 +269,7 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     train_args = checkpoint.get("args", {})
     task, num_classes, class_names = resolve_task_config(args, checkpoint)
+    include_classes = args.include_classes or train_args.get("include_classes")
     aggregation = args.eval_aggregation or train_args.get("eval_aggregation", "mean")
     topk = args.topk or int(train_args.get("topk", 3))
     output_dir = (
@@ -286,6 +292,7 @@ def main() -> None:
         eval_clips=args.eval_clips,
         num_classes=num_classes,
         class_names=class_names if task == "multiclass" else None,
+        include_classes=include_classes,
     )
     loader = DataLoader(
         dataset,

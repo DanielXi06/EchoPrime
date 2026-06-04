@@ -49,6 +49,18 @@ def parse_class_names(value: str | list[str] | tuple[str, ...] | None) -> list[s
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _row_matches_include_classes(
+    row: dict[str, str],
+    label_column: str,
+    include_classes: str | list[str] | tuple[str, ...] | None,
+) -> bool:
+    names = parse_class_names(include_classes)
+    if not names:
+        return True
+    allowed = {name.lower() for name in names}
+    return str(row.get(label_column, "")).strip().lower() in allowed
+
+
 def parse_label(
     value: str,
     num_classes: int = 1,
@@ -107,6 +119,7 @@ def load_video_records(
     split_value: str | None = None,
     num_classes: int = 1,
     class_names: str | list[str] | tuple[str, ...] | None = None,
+    include_classes: str | list[str] | tuple[str, ...] | None = None,
 ) -> list[VideoRecord]:
     csv_path = Path(csv_path)
     records: list[VideoRecord] = []
@@ -124,6 +137,8 @@ def load_video_records(
             if split_column and split_value is not None:
                 if str(row.get(split_column, "")).strip() != str(split_value):
                     continue
+            if not _row_matches_include_classes(row, label_column, include_classes):
+                continue
             records.append(
                 VideoRecord(
                     video_path=_resolve_video_path(row[path_column], csv_path, data_root),
@@ -309,6 +324,7 @@ class EchoPrimeVideoDataset(Dataset):
         zoom: float = 0.1,
         num_classes: int = 1,
         class_names: str | list[str] | tuple[str, ...] | None = None,
+        include_classes: str | list[str] | tuple[str, ...] | None = None,
     ) -> None:
         if mode not in {"train", "eval"}:
             raise ValueError(f"mode must be 'train' or 'eval', got {mode!r}")
@@ -321,6 +337,7 @@ class EchoPrimeVideoDataset(Dataset):
             split_value=split_value,
             num_classes=num_classes,
             class_names=class_names,
+            include_classes=include_classes,
         )
         self.mode = mode
         self.eval_clips = int(eval_clips)
